@@ -1,5 +1,6 @@
 ﻿absl-py==2.3.1
 addict==2.4.0
+simple-lama-inpainting>=0.1.2
 annotated-types==0.7.0
 anyio==4.10.0
 asttokens==3.0.0
