@@ -69,6 +69,13 @@ def grayscale_to_b64(image_array: np.ndarray) -> str:
     return pil_to_b64(pil_img)
 
 
+def array_to_png_bytes(image_array: np.ndarray) -> bytes:
+    pil_img = PIL.Image.fromarray(image_array)
+    buf = io.BytesIO()
+    pil_img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def build_segmentation_status(metrics: dict, strategy: str) -> str:
     warnings = set(metrics.get("warnings", []))
     if "mask_empty" in warnings or "mask_too_small" in warnings:
@@ -223,6 +230,7 @@ async def segment_petroglyph(
 )
 async def reconstruct_petroglyph(
     image: UploadFile = File(...),
+    mask: UploadFile | None = File(None),
     threshold: float = Form(DEFAULT_SEGMENTATION_THRESHOLD),
     min_area: int = Form(DEFAULT_SEGMENTATION_MIN_AREA),
 ):
@@ -257,6 +265,8 @@ async def reconstruct_petroglyph(
         raise HTTPException(status_code=500, detail="Modelo LaMa no cargado")
     if not image.content_type or not image.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Debes enviar un archivo de imagen valido")
+    if mask is not None and (not mask.content_type or not mask.content_type.startswith("image/")):
+        raise HTTPException(status_code=400, detail="La mascara debe ser un archivo de imagen valido")
 
     content = await image.read()
     if not content:
@@ -266,6 +276,21 @@ async def reconstruct_petroglyph(
     img_bgr = petroglyph.cv2.imdecode(np_buffer, petroglyph.cv2.IMREAD_COLOR)
     if img_bgr is None:
         raise HTTPException(status_code=400, detail="No se pudo leer la imagen enviada")
+    manual_damage_mask = None
+    if mask is not None:
+        mask_content = await mask.read()
+        if not mask_content:
+            raise HTTPException(status_code=400, detail="La mascara enviada esta vacia")
+        mask_buffer = np.frombuffer(mask_content, np.uint8)
+        mask_img = petroglyph.cv2.imdecode(mask_buffer, petroglyph.cv2.IMREAD_GRAYSCALE)
+        if mask_img is None:
+            raise HTTPException(status_code=400, detail="No se pudo leer la mascara enviada")
+        mask_img = petroglyph.cv2.resize(
+            mask_img,
+            (petroglyph.IMG_SIZE, petroglyph.IMG_SIZE),
+            interpolation=petroglyph.cv2.INTER_NEAREST,
+        )
+        manual_damage_mask = np.where(mask_img > 127, 255, 0).astype(np.uint8)
 
     result = reconstruir.reconstruct_petroglyph(
         SEGMENTATION_MODEL,
@@ -273,14 +298,11 @@ async def reconstruct_petroglyph(
         img_bgr,
         threshold=threshold,
         min_area=min_area,
+        manual_damage_mask=manual_damage_mask,
     )
 
-    rendered = result["rendered_rgb"]
-    pil_img = PIL.Image.fromarray(rendered)
-    buf = io.BytesIO()
-    pil_img.save(buf, format="PNG")
-    buf.seek(0)
-    return Response(content=buf.getvalue(), media_type="image/png")
+    composed = result["composed_rgb"]
+    return Response(content=array_to_png_bytes(composed), media_type="image/png")
 
 
 @app.post(
@@ -294,6 +316,7 @@ async def reconstruct_petroglyph(
 )
 async def reconstruct_petroglyph_full(
     file: UploadFile = File(...),
+    mask: UploadFile | None = File(None),
     threshold: float = Form(DEFAULT_SEGMENTATION_THRESHOLD),
     min_area: int = Form(DEFAULT_SEGMENTATION_MIN_AREA),
     line_width: int = Form(DEFAULT_SEGMENTATION_LINE_WIDTH),
@@ -303,7 +326,9 @@ async def reconstruct_petroglyph_full(
     Devuelve todas las etapas del pipeline Keras + LaMa en base64.
 
     Campos del JSON:
-    - ``result_image``             : reconstrucción final sobre fondo pétreo
+    - ``result_image``             : imagen reparada principal (composición suave)
+    - ``rendered_image``           : reconstrucción final sobre fondo pétreo
+    - ``composed_image``           : composición suave original + LaMa
     - ``inpainted_image``          : imagen tras inpainting LaMa
     - ``mask_image``               : máscara binaria final del petroglifo
     - ``damage_mask_image``        : máscara de zonas reconstruidas por LaMa
@@ -344,12 +369,29 @@ async def reconstruct_petroglyph_full(
     if img_bgr is None:
         raise HTTPException(status_code=400, detail="No se pudo leer la imagen enviada")
 
+    manual_damage_mask = None
+    if mask is not None:
+        mask_content = await mask.read()
+        if not mask_content:
+            raise HTTPException(status_code=400, detail="La mascara enviada esta vacia")
+        mask_buffer = np.frombuffer(mask_content, np.uint8)
+        mask_img = petroglyph.cv2.imdecode(mask_buffer, petroglyph.cv2.IMREAD_GRAYSCALE)
+        if mask_img is None:
+            raise HTTPException(status_code=400, detail="No se pudo leer la mascara enviada")
+        mask_img = petroglyph.cv2.resize(
+            mask_img,
+            (petroglyph.IMG_SIZE, petroglyph.IMG_SIZE),
+            interpolation=petroglyph.cv2.INTER_NEAREST,
+        )
+        manual_damage_mask = np.where(mask_img > 127, 255, 0).astype(np.uint8)
+
     result = reconstruir.reconstruct_petroglyph(
         SEGMENTATION_MODEL,
         LAMA_MODEL,
         img_bgr,
         threshold=threshold,
         min_area=min_area,
+        manual_damage_mask=manual_damage_mask,
     )
 
     metrics = result["metrics"]
@@ -375,7 +417,9 @@ async def reconstruct_petroglyph_full(
             "width": petroglyph.IMG_SIZE,
             "height": petroglyph.IMG_SIZE,
         },
-        "result_image": array_to_b64(result["rendered_rgb"]),
+        "result_image": array_to_b64(result["composed_rgb"]),
+        "rendered_image": array_to_b64(result["rendered_rgb"]),
+        "composed_image": array_to_b64(result["composed_rgb"]),
         "inpainted_image": array_to_b64(result["inpainted_rgb"]),
         "mask_image": grayscale_to_b64(result["filled_mask"]),
         "damage_mask_image": grayscale_to_b64(result["damage_mask"]),
@@ -399,3 +443,81 @@ async def reconstruct_petroglyph_full(
         )
 
     return response
+
+
+@app.post(
+    "/reconstructFullPng",
+    summary="Reconstrucción de petroglifo (salida PNG reparada)",
+    description=(
+        "Igual que /reconstructFull, pero devuelve directamente la imagen reparada "
+        "principal como PNG binario."
+    ),
+    response_class=Response,
+)
+async def reconstruct_petroglyph_full_png(
+    file: UploadFile = File(...),
+    mask: UploadFile | None = File(None),
+    threshold: float = Form(DEFAULT_SEGMENTATION_THRESHOLD),
+    min_area: int = Form(DEFAULT_SEGMENTATION_MIN_AREA),
+):
+    global SEGMENTATION_MODEL, LAMA_MODEL
+
+    if not (0.0 < threshold < 1.0):
+        raise HTTPException(status_code=400, detail="threshold debe estar en (0, 1)")
+    if not (0 <= min_area <= 50000):
+        raise HTTPException(status_code=400, detail="min_area debe estar entre 0 y 50000")
+
+    if reconstruir is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Reconstruccion no disponible: {RECONSTRUCTION_IMPORT_ERROR}",
+        )
+    if SEGMENTATION_MODEL is None:
+        raise HTTPException(status_code=500, detail="Modelo Keras no cargado")
+    if LAMA_MODEL is None:
+        raise HTTPException(status_code=500, detail="Modelo LaMa no cargado")
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Debes enviar un archivo de imagen valido")
+    if mask is not None and (not mask.content_type or not mask.content_type.startswith("image/")):
+        raise HTTPException(status_code=400, detail="La mascara debe ser un archivo de imagen valido")
+    if mask is not None and (not mask.content_type or not mask.content_type.startswith("image/")):
+        raise HTTPException(status_code=400, detail="La mascara debe ser un archivo de imagen valido")
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="La imagen enviada esta vacia")
+
+    np_buffer = np.frombuffer(content, np.uint8)
+    img_bgr = petroglyph.cv2.imdecode(np_buffer, petroglyph.cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        raise HTTPException(status_code=400, detail="No se pudo leer la imagen enviada")
+
+    manual_damage_mask = None
+    if mask is not None:
+        mask_content = await mask.read()
+        if not mask_content:
+            raise HTTPException(status_code=400, detail="La mascara enviada esta vacia")
+        mask_buffer = np.frombuffer(mask_content, np.uint8)
+        mask_img = petroglyph.cv2.imdecode(mask_buffer, petroglyph.cv2.IMREAD_GRAYSCALE)
+        if mask_img is None:
+            raise HTTPException(status_code=400, detail="No se pudo leer la mascara enviada")
+        mask_img = petroglyph.cv2.resize(
+            mask_img,
+            (petroglyph.IMG_SIZE, petroglyph.IMG_SIZE),
+            interpolation=petroglyph.cv2.INTER_NEAREST,
+        )
+        manual_damage_mask = np.where(mask_img > 127, 255, 0).astype(np.uint8)
+
+    result = reconstruir.reconstruct_petroglyph(
+        SEGMENTATION_MODEL,
+        LAMA_MODEL,
+        img_bgr,
+        threshold=threshold,
+        min_area=min_area,
+        manual_damage_mask=manual_damage_mask,
+    )
+
+    return Response(
+        content=array_to_png_bytes(result["composed_rgb"]),
+        media_type="image/png",
+    )

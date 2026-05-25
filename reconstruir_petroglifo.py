@@ -14,6 +14,8 @@ from __future__ import annotations
 import cv2
 import numpy as np
 import PIL.Image
+import PIL.ImageFilter
+import os
 from pathlib import Path
 
 from segmentar_petroglifo import (
@@ -35,6 +37,7 @@ from segmentar_petroglifo import (
 DEFAULT_DAMAGE_LOW_THRESH: float = 0.10
 DEFAULT_DAMAGE_HIGH_THRESH: float = 0.45
 DEFAULT_DAMAGE_DILATION_PX: int = 30
+DEFAULT_COMPOSE_BLUR_RADIUS: float = 3.0
 
 
 # ---------------------------------------------------------------------------
@@ -83,9 +86,11 @@ def load_lama_model(model_path: str | None = DEFAULT_LAMA_MODEL_PATH) -> object:
 
     if fine_tuned_path is not None and fine_tuned_path.is_file():
         print(f"  → Usando pesos fine-tuneados: {fine_tuned_path}")
-        return SimpleLama(model_path=str(fine_tuned_path))
+        os.environ["LAMA_MODEL"] = str(fine_tuned_path)
+    else:
+        print("  → Pesos fine-tuneados no encontrados, usando pesos genéricos preentrenados.")
+        os.environ.pop("LAMA_MODEL", None)
 
-    print("  → Pesos fine-tuneados no encontrados, usando pesos genéricos preentrenados.")
     return SimpleLama()
 
 
@@ -123,6 +128,34 @@ def _lama_inpaint(
     result_pil = lama_model(img_pil, mask_pil)
     result_rgb = np.array(result_pil.convert("RGB"))
     return cv2.cvtColor(result_rgb, cv2.COLOR_RGB2BGR)
+
+
+def soft_compose_with_mask(
+    base_rgb: np.ndarray,
+    overlay_rgb: np.ndarray,
+    mask: np.ndarray,
+    blur_radius: float = DEFAULT_COMPOSE_BLUR_RADIUS,
+) -> np.ndarray:
+    """
+    Mezcla suavemente ``overlay_rgb`` sobre ``base_rgb`` usando ``mask``.
+
+    La máscara se difumina con Gaussian blur para evitar bordes duros en la
+    transición entre la zona reconstruida y la imagen original.
+    """
+    if base_rgb.shape != overlay_rgb.shape:
+        raise ValueError("base_rgb y overlay_rgb deben tener la misma forma")
+    if mask.ndim != 2:
+        raise ValueError("mask debe tener 2 dimensiones")
+
+    mask_pil = PIL.Image.fromarray(mask.astype(np.uint8)).convert("L")
+    alpha = mask_pil.filter(PIL.ImageFilter.GaussianBlur(radius=blur_radius))
+    alpha_np = np.array(alpha, dtype=np.float32) / 255.0
+    alpha_np = alpha_np[..., None]
+
+    base_np = base_rgb.astype(np.float32)
+    overlay_np = overlay_rgb.astype(np.float32)
+    composed = base_np * (1.0 - alpha_np) + overlay_np * alpha_np
+    return np.clip(composed, 0, 255).astype(np.uint8)
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +229,7 @@ def reconstruct_petroglyph(
     damage_low_thresh: float = DEFAULT_DAMAGE_LOW_THRESH,
     damage_high_thresh: float = DEFAULT_DAMAGE_HIGH_THRESH,
     damage_dilation_px: int = DEFAULT_DAMAGE_DILATION_PX,
+    manual_damage_mask: np.ndarray | None = None,
 ) -> dict[str, object]:
     """
     Reconstruye un petroglifo deteriorado usando Keras + LaMa GAN.
@@ -230,12 +264,16 @@ def reconstruct_petroglyph(
         Umbral alto (zona confirmada como petroglifo).
     damage_dilation_px : int
         Radio de dilatación para detección de vecindad de daño.
+    manual_damage_mask : np.ndarray | None
+        Máscara binaria opcional (255 = zona a reconstruir). Si se proporciona,
+        se usa en lugar de la detección automática de daño.
 
     Returns
     -------
     dict con claves:
         - ``original_rgb``          : imagen original redimensionada (RGB, uint8)
         - ``inpainted_rgb``         : imagen tras inpainting LaMa (RGB, uint8)
+        - ``composed_rgb``          : mezcla suave entre original e inpainted
         - ``probability``           : mapa de probabilidad Keras original (H×W)
         - ``probability_merged``    : mapa combinado post-LaMa (H×W)
         - ``filled_mask``           : máscara binaria final del petroglifo (uint8)
@@ -259,12 +297,15 @@ def reconstruct_petroglyph(
     metrics: dict = selected["metrics"]  # type: ignore[assignment]
 
     # 3. Detección de zonas dañadas (surcos erosionados, líquenes, fracturas)
-    damage_mask = detect_damage_region(
-        probability,
-        low_thresh=damage_low_thresh,
-        high_thresh=damage_high_thresh,
-        dilation_px=damage_dilation_px,
-    )
+    if manual_damage_mask is not None:
+        damage_mask = manual_damage_mask.astype(np.uint8)
+    else:
+        damage_mask = detect_damage_region(
+            probability,
+            low_thresh=damage_low_thresh,
+            high_thresh=damage_high_thresh,
+            dilation_px=damage_dilation_px,
+        )
     damage_pixel_count = int((damage_mask > 0).sum())
 
     # 4. LaMa GAN: inpainting generativo en zonas dañadas
@@ -272,6 +313,15 @@ def reconstruct_petroglyph(
         inpainted_bgr = _lama_inpaint(lama_model, img_resized, damage_mask)
     else:
         inpainted_bgr = img_resized.copy()
+
+    # 4.1 Composición suave guiada por la máscara para conservar el contexto
+    original_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+    inpainted_rgb = cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB)
+    composed_rgb = soft_compose_with_mask(
+        original_rgb,
+        inpainted_rgb,
+        damage_mask,
+    )
 
     # 5. Re-segmentación Keras sobre imagen reconstruida por LaMa
     #    → combina ambos mapas de probabilidad para refinar la máscara final
@@ -297,13 +347,10 @@ def reconstruct_petroglyph(
     background_rgb, background_name = choose_background(background_path)
     rendered_rgb = render_petroglyph(background_rgb, final_mask)
 
-    # Conversiones a RGB para la respuesta
-    original_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
-    inpainted_rgb = cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB)
-
     return {
         "original_rgb": original_rgb,
         "inpainted_rgb": inpainted_rgb,
+        "composed_rgb": composed_rgb,
         "probability": probability,
         "probability_merged": probability_merged,
         "filled_mask": final_mask,
