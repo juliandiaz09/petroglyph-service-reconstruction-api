@@ -77,6 +77,7 @@ tb-nightly==2.21.0a20251023
 tensorboard-data-server==0.7.2
 tensorflow==2.16.1
 tifffile==2025.5.10
+segmentation-models-pytorch==0.5.0
 torch==2.0.1
 torchaudio==2.0.2
 torchvision==0.15.2

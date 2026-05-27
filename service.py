@@ -2,6 +2,7 @@
 import base64
 import io
 import warnings
+from pathlib import Path
 
 import PIL.Image
 import numpy as np
@@ -28,14 +29,20 @@ app.add_middleware(
 
 SEGMENTATION_MODEL = None
 LAMA_MODEL = None
+PYTORCH_DAMAGE_MODEL = None
 PETROGLYPH_IMPORT_ERROR = None
 petroglyph = None
 reconstruir = None
 RECONSTRUCTION_IMPORT_ERROR = None
+damage_segmentation = None
+PYTORCH_SEGMENTATION_IMPORT_ERROR = None
 
 DEFAULT_SEGMENTATION_THRESHOLD = 0.5
 DEFAULT_SEGMENTATION_MIN_AREA = 150
 DEFAULT_SEGMENTATION_LINE_WIDTH = 2
+DEFAULT_DAMAGE_SEGMENTATION_THRESHOLD = 0.20
+DEFAULT_DAMAGE_SEGMENTATION_MIN_AREA = 30
+VISUAL_ASSISTED_OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
 
 try:
     import segmentar_petroglifo as petroglyph  # type: ignore[import-not-found]
@@ -52,6 +59,15 @@ try:
 except Exception as exc:
     RECONSTRUCTION_IMPORT_ERROR = exc
     reconstruir = None
+
+try:
+    import segmentar_danos_pytorch as damage_segmentation  # type: ignore[import-not-found]
+except Exception as exc:
+    PYTORCH_SEGMENTATION_IMPORT_ERROR = exc
+    damage_segmentation = None
+else:
+    DEFAULT_DAMAGE_SEGMENTATION_THRESHOLD = damage_segmentation.DEFAULT_THRESHOLD
+    DEFAULT_DAMAGE_SEGMENTATION_MIN_AREA = damage_segmentation.DEFAULT_MIN_AREA
 
 def pil_to_b64(pil_img: PIL.Image.Image) -> str:
     buf = io.BytesIO()
@@ -87,9 +103,44 @@ def build_segmentation_status(metrics: dict, strategy: str) -> str:
     return "ok"
 
 
+def ensure_pytorch_damage_model():
+    global PYTORCH_DAMAGE_MODEL
+
+    if damage_segmentation is None:
+        raise RuntimeError(
+            "La segmentacion PyTorch no esta disponible porque faltan dependencias "
+            f"({PYTORCH_SEGMENTATION_IMPORT_ERROR})."
+        )
+
+    if PYTORCH_DAMAGE_MODEL is None:
+        PYTORCH_DAMAGE_MODEL, pytorch_device = damage_segmentation.load_model(
+            damage_segmentation.MODEL_PATH
+        )
+        print(f"Modelo PyTorch cargado bajo demanda en {pytorch_device}.")
+
+    return PYTORCH_DAMAGE_MODEL, next(PYTORCH_DAMAGE_MODEL.parameters()).device
+
+
+def predict_pytorch_damage_mask(
+    img_bgr: np.ndarray,
+    threshold: float = DEFAULT_DAMAGE_SEGMENTATION_THRESHOLD,
+    min_area: int = DEFAULT_DAMAGE_SEGMENTATION_MIN_AREA,
+    aggressive: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    model, device = ensure_pytorch_damage_model()
+    return damage_segmentation.predict_mask(
+        model=model,
+        img_bgr=img_bgr,
+        device=device,
+        threshold=threshold,
+        min_area=min_area,
+        aggressive=aggressive,
+    )
+
+
 @app.on_event("startup")
 async def startup_event():
-    global SEGMENTATION_MODEL, LAMA_MODEL
+    global SEGMENTATION_MODEL, LAMA_MODEL, PYTORCH_DAMAGE_MODEL
 
     if petroglyph is None:
         print(f"Segmentacion deshabilitada: {PETROGLYPH_IMPORT_ERROR}")
@@ -123,6 +174,18 @@ async def startup_event():
         print("Modelo LaMa cargado correctamente.")
     except Exception as e:
         print(f"Error cargando modelo LaMa: {e}")
+
+    if damage_segmentation is None:
+        print(f"Segmentacion PyTorch deshabilitada: {PYTORCH_SEGMENTATION_IMPORT_ERROR}")
+        return
+
+    pytorch_model_path = str(damage_segmentation.MODEL_PATH)
+    print(f"Cargando modelo PyTorch de segmentacion desde {pytorch_model_path} ...")
+    try:
+        PYTORCH_DAMAGE_MODEL, pytorch_device = damage_segmentation.load_model(pytorch_model_path)
+        print(f"Modelo PyTorch cargado correctamente en {pytorch_device}.")
+    except Exception as e:
+        print(f"Error cargando modelo PyTorch: {e}")
 
 
 @app.post("/segmentPetroglyph")
@@ -212,6 +275,76 @@ async def segment_petroglyph(
     return response
 
 
+@app.post("/segmentDamagePytorch")
+async def segment_damage_pytorch(
+    file: UploadFile = File(...),
+    threshold: float = Form(DEFAULT_DAMAGE_SEGMENTATION_THRESHOLD),
+    min_area: int = Form(DEFAULT_DAMAGE_SEGMENTATION_MIN_AREA),
+    aggressive: bool = Form(False),
+    save_png: bool = Form(True),
+):
+    global PYTORCH_DAMAGE_MODEL
+
+    if damage_segmentation is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "La segmentacion PyTorch no esta disponible porque faltan dependencias "
+                f"({PYTORCH_SEGMENTATION_IMPORT_ERROR})."
+            ),
+        )
+
+    if not (0.0 < threshold < 1.0):
+        raise HTTPException(status_code=400, detail="threshold debe estar en (0, 1)")
+    if not (0 <= min_area <= 50000):
+        raise HTTPException(status_code=400, detail="min_area debe estar entre 0 y 50000")
+
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Debes enviar un archivo de imagen valido")
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="La imagen enviada esta vacia")
+
+    np_buffer = np.frombuffer(content, np.uint8)
+    img_bgr = petroglyph.cv2.imdecode(np_buffer, petroglyph.cv2.IMREAD_COLOR) if petroglyph else None
+    if img_bgr is None:
+        raise HTTPException(status_code=400, detail="No se pudo leer la imagen enviada")
+
+    try:
+        probability, mask = predict_pytorch_damage_mask(
+            img_bgr=img_bgr,
+            threshold=threshold,
+            min_area=min_area,
+            aggressive=aggressive,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"No se pudo ejecutar la segmentacion PyTorch: {exc}") from exc
+
+    mask_path = None
+    if save_png:
+        from pathlib import Path
+
+        output_dir = Path(__file__).resolve().parent / "outputs"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        mask_path = damage_segmentation.save_mask_png(
+            mask,
+            output_dir / f"{Path(file.filename or 'mask').stem}_mascara.png",
+        )
+
+    probability_img = np.clip(probability * 255.0, 0, 255).astype(np.uint8)
+
+    return {
+        "filename": file.filename,
+        "threshold": float(threshold),
+        "min_area": int(min_area),
+        "aggressive": bool(aggressive),
+        "mask_path": str(mask_path) if mask_path else None,
+        "mask_image": grayscale_to_b64(mask),
+        "probability_image": grayscale_to_b64(probability_img),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Endpoints de reconstrucción
 # Compatible con el agente A5 del sistema multiagente BackendPetroglifos
@@ -291,6 +424,16 @@ async def reconstruct_petroglyph(
             interpolation=petroglyph.cv2.INTER_NEAREST,
         )
         manual_damage_mask = np.where(mask_img > 127, 255, 0).astype(np.uint8)
+    else:
+        try:
+            _, manual_damage_mask = predict_pytorch_damage_mask(
+                img_bgr=img_bgr,
+                threshold=DEFAULT_DAMAGE_SEGMENTATION_THRESHOLD,
+                min_area=DEFAULT_DAMAGE_SEGMENTATION_MIN_AREA,
+                aggressive=False,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"No se pudo generar la mascara PyTorch: {exc}") from exc
 
     result = reconstruir.reconstruct_petroglyph(
         SEGMENTATION_MODEL,
@@ -301,8 +444,7 @@ async def reconstruct_petroglyph(
         manual_damage_mask=manual_damage_mask,
     )
 
-    composed = result["composed_rgb"]
-    return Response(content=array_to_png_bytes(composed), media_type="image/png")
+    return Response(content=array_to_png_bytes(result["composed_rgb"]), media_type="image/png")
 
 
 @app.post(
@@ -384,6 +526,15 @@ async def reconstruct_petroglyph_full(
             interpolation=petroglyph.cv2.INTER_NEAREST,
         )
         manual_damage_mask = np.where(mask_img > 127, 255, 0).astype(np.uint8)
+    else:
+        try:
+            _, manual_damage_mask = predict_pytorch_damage_mask(
+                img_bgr=img_bgr,
+                threshold=DEFAULT_DAMAGE_SEGMENTATION_THRESHOLD,
+                min_area=DEFAULT_DAMAGE_SEGMENTATION_MIN_AREA,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"No se pudo generar la mascara PyTorch: {exc}") from exc
 
     result = reconstruir.reconstruct_petroglyph(
         SEGMENTATION_MODEL,
@@ -507,6 +658,15 @@ async def reconstruct_petroglyph_full_png(
             interpolation=petroglyph.cv2.INTER_NEAREST,
         )
         manual_damage_mask = np.where(mask_img > 127, 255, 0).astype(np.uint8)
+    else:
+        try:
+            _, manual_damage_mask = predict_pytorch_damage_mask(
+                img_bgr=img_bgr,
+                threshold=DEFAULT_DAMAGE_SEGMENTATION_THRESHOLD,
+                min_area=DEFAULT_DAMAGE_SEGMENTATION_MIN_AREA,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"No se pudo generar la mascara PyTorch: {exc}") from exc
 
     result = reconstruir.reconstruct_petroglyph(
         SEGMENTATION_MODEL,
@@ -521,3 +681,135 @@ async def reconstruct_petroglyph_full_png(
         content=array_to_png_bytes(result["composed_rgb"]),
         media_type="image/png",
     )
+
+
+@app.post("/reconstructVisualAssisted")
+async def reconstruct_visual_assisted(
+    file: UploadFile = File(...),
+    damage_threshold: float = Form(DEFAULT_DAMAGE_SEGMENTATION_THRESHOLD),
+    damage_min_area: int = Form(DEFAULT_DAMAGE_SEGMENTATION_MIN_AREA),
+    guide_threshold: float = Form(DEFAULT_SEGMENTATION_THRESHOLD),
+    guide_min_area: int = Form(DEFAULT_SEGMENTATION_MIN_AREA),
+    guide_line_width: int = Form(DEFAULT_SEGMENTATION_LINE_WIDTH),
+    include_previews: bool = Form(True),
+    save_png: bool = Form(True),
+):
+    """
+    Pipeline visual asistido:
+    1. U-Net PyTorch v3 detecta dano.
+    2. LaMa rellena solo textura de roca.
+    3. El modelo Keras genera la guia del trazo.
+    4. La guia se limita al dano y se oscurece para simular surco grabado.
+    """
+    global SEGMENTATION_MODEL, LAMA_MODEL
+
+    if not (0.0 < damage_threshold < 1.0):
+        raise HTTPException(status_code=400, detail="damage_threshold debe estar en (0, 1)")
+    if not (0 < damage_min_area <= 50000):
+        raise HTTPException(status_code=400, detail="damage_min_area debe estar entre 1 y 50000")
+    if not (0.0 < guide_threshold < 1.0):
+        raise HTTPException(status_code=400, detail="guide_threshold debe estar en (0, 1)")
+    if not (0 <= guide_min_area <= 50000):
+        raise HTTPException(status_code=400, detail="guide_min_area debe estar entre 0 y 50000")
+    if not (1 <= guide_line_width <= 25):
+        raise HTTPException(status_code=400, detail="guide_line_width debe estar entre 1 y 25")
+
+    if petroglyph is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "La segmentacion no esta disponible porque faltan dependencias del modelo "
+                f"({PETROGLYPH_IMPORT_ERROR})."
+            ),
+        )
+    if reconstruir is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Reconstruccion no disponible: {RECONSTRUCTION_IMPORT_ERROR}",
+        )
+    if SEGMENTATION_MODEL is None:
+        raise HTTPException(status_code=500, detail="Modelo Keras no cargado")
+    if LAMA_MODEL is None:
+        raise HTTPException(status_code=500, detail="Modelo LaMa no cargado")
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Debes enviar un archivo de imagen valido")
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="La imagen enviada esta vacia")
+
+    np_buffer = np.frombuffer(content, np.uint8)
+    img_bgr = petroglyph.cv2.imdecode(np_buffer, petroglyph.cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        raise HTTPException(status_code=400, detail="No se pudo leer la imagen enviada")
+
+    damage_model, damage_device = ensure_pytorch_damage_model()
+    try:
+        result = reconstruir.reconstruct_visual_assisted(
+            SEGMENTATION_MODEL,
+            LAMA_MODEL,
+            damage_model,
+            damage_device,
+            img_bgr,
+            damage_threshold=damage_threshold,
+            damage_min_area=damage_min_area,
+            guide_threshold=guide_threshold,
+            guide_min_area=guide_min_area,
+            guide_line_width=guide_line_width,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"No se pudo ejecutar el pipeline asistido: {exc}") from exc
+
+    output_paths = None
+    if save_png:
+        stem = Path(file.filename or "petroglifo").stem
+        output_paths = reconstruir.save_visual_assisted_outputs(
+            VISUAL_ASSISTED_OUTPUT_DIR,
+            stem,
+            result["original_rgb"],
+            result["damage_probability"],
+            result["damage_mask"],
+            result["lama_rgb"],
+            result["guide_mask"],
+            result["missing_stroke"],
+            result["fused_rgb"],
+        )
+
+    response: dict = {
+        "filename": file.filename,
+        "damage_threshold": float(damage_threshold),
+        "damage_min_area": int(damage_min_area),
+        "guide_threshold": float(guide_threshold),
+        "guide_min_area": int(guide_min_area),
+        "guide_line_width": int(guide_line_width),
+        "damage_pixel_count": int(result["damage_pixel_count"]),
+        "guide_pixel_count": int(result["guide_pixel_count"]),
+        "selected_guide_threshold": float(result["selected_guide_threshold"]),
+        "selected_guide_strategy": result["selected_guide_strategy"],
+        "guide_metrics": result["guide_metrics"],
+        "final_image": array_to_b64(result["fused_rgb"]),
+        "fused_image": array_to_b64(result["fused_rgb"]),
+        "lama_image": array_to_b64(result["lama_rgb"]),
+        "damage_mask_image": grayscale_to_b64(result["damage_mask"]),
+        "guide_mask_image": grayscale_to_b64(result["guide_mask"]),
+        "missing_stroke_image": grayscale_to_b64(result["missing_stroke"]),
+    }
+
+    if include_previews:
+        response.update(
+            {
+                "original_image": array_to_b64(result["original_rgb"]),
+                "damage_probability_image": grayscale_to_b64(
+                    np.clip(result["damage_probability"] * 255.0, 0, 255).astype(np.uint8)
+                ),
+                "guide_probability_image": grayscale_to_b64(
+                    np.clip(result["guide_probability"] * 255.0, 0, 255).astype(np.uint8)
+                ),
+                "guide_base_mask_image": grayscale_to_b64(result["guide_mask_base"]),
+            }
+        )
+
+    if output_paths is not None:
+        response["saved_paths"] = {key: str(path) for key, path in output_paths.items()}
+
+    return response

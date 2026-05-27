@@ -167,6 +167,49 @@ curl -X POST "http://localhost:8000/generateSeveral" \
   -d '{"number": 3}'
 ```
 
+## Segmentacion PyTorch de danos
+
+El modelo `modelo/unet_danos_petroglifos_v3.pth` se usa con la configuracion del notebook:
+
+- `threshold = 0.20`
+- `min_area = 30`
+- limpieza morfologica ligera con dilatacion para preparar la mascara de LaMa
+
+Se puede ejecutar de dos formas:
+
+```bash
+# Guardar la mascara binaria como PNG en outputs/
+python segmentar_danos_pytorch.py --image test_input.png --output-dir outputs
+```
+
+Tambien queda disponible en la API:
+
+- `POST /segmentDamagePytorch`
+- Campos: `file`, `threshold`, `min_area`, `save_png`
+- Respuesta: JSON con `mask_path`, `mask_image` y `probability_image`
+
+## Restauracion visual asistida
+
+El pipeline nuevo combina:
+
+- U-Net PyTorch `v3` para detectar dano
+- LaMa para reconstruir solo la textura de roca
+- Keras para guiar el trazo faltante
+- Fusion final del trazo oscurecido sobre la roca restaurada
+
+Endpoint principal:
+
+- `POST /reconstructVisualAssisted`
+
+La respuesta incluye:
+
+- `damage_mask_image`
+- `lama_image`
+- `guide_mask_image`
+- `missing_stroke_image`
+- `final_image`
+- `saved_paths` cuando `save_png=true`
+
 ## Estructura del proyecto
 
 ```

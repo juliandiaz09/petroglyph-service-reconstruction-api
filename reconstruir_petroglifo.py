@@ -18,10 +18,19 @@ import PIL.ImageFilter
 import os
 from pathlib import Path
 
+try:
+    import segmentar_danos_pytorch as damage_segmentation  # type: ignore[import-not-found]
+except Exception as exc:  # pragma: no cover - optional import guard
+    damage_segmentation = None
+    DAMAGE_SEGMENTATION_IMPORT_ERROR = exc
+else:
+    DAMAGE_SEGMENTATION_IMPORT_ERROR = None
+
 from segmentar_petroglifo import (
     IMG_SIZE,
     DEFAULT_THRESHOLD,
     DEFAULT_MIN_AREA,
+    DEFAULT_LINE_WIDTH,
     preprocess,
     predict_tta,
     select_best_mask,
@@ -38,6 +47,13 @@ DEFAULT_DAMAGE_LOW_THRESH: float = 0.10
 DEFAULT_DAMAGE_HIGH_THRESH: float = 0.45
 DEFAULT_DAMAGE_DILATION_PX: int = 30
 DEFAULT_COMPOSE_BLUR_RADIUS: float = 3.0
+DEFAULT_MANUAL_DAMAGE_EXPANSION_PX: int = 0
+DEFAULT_VISUAL_ASSISTED_STROKE_DILATION_PX: int = 1
+DEFAULT_VISUAL_ASSISTED_STROKE_BLUR_SIGMA: float = 2.2
+DEFAULT_VISUAL_ASSISTED_STROKE_DARKENING: float = 0.58
+DEFAULT_VISUAL_ASSISTED_HALO_STRENGTH: float = 0.14
+DEFAULT_VISUAL_ASSISTED_HALO_OFFSET: tuple[int, int] = (-1, -1)
+DEFAULT_VISUAL_ASSISTED_GUIDE_LINE_WIDTH: int = 2
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +146,53 @@ def _lama_inpaint(
     return cv2.cvtColor(result_rgb, cv2.COLOR_RGB2BGR)
 
 
+def _telea_inpaint(
+    img_bgr: np.ndarray,
+    damage_mask: np.ndarray,
+    radius: int = 9,
+) -> np.ndarray:
+    mask_u8 = (damage_mask > 0).astype(np.uint8) * 255
+    return cv2.inpaint(img_bgr, mask_u8, radius, cv2.INPAINT_TELEA)
+
+
+def _hybrid_inpaint(
+    img_bgr: np.ndarray,
+    lama_bgr: np.ndarray,
+    telea_bgr: np.ndarray,
+    damage_mask: np.ndarray,
+) -> np.ndarray:
+    """
+    Mezcla LaMa con Telea para evitar que una predicciÃ³n demasiado conservadora
+    termine devolviendo una imagen casi idÃ©ntica al original.
+    """
+    mask_alpha = cv2.GaussianBlur(
+        (damage_mask > 0).astype(np.float32),
+        (0, 0),
+        sigmaX=6.0,
+        sigmaY=6.0,
+    )
+    mask_alpha = np.clip(mask_alpha * 1.50, 0.0, 1.0)[..., None]
+
+    original = img_bgr.astype(np.float32)
+    lama = lama_bgr.astype(np.float32)
+    telea = telea_bgr.astype(np.float32)
+
+    lama_delta = 0.0
+    telea_delta = 0.0
+    masked = damage_mask > 0
+    if np.any(masked):
+        lama_delta = float(np.mean(np.abs(lama[masked] - original[masked])))
+        telea_delta = float(np.mean(np.abs(telea[masked] - original[masked])))
+
+    telea_weight = 1.00 if lama_delta < 12.0 else 0.80
+    if telea_delta > lama_delta:
+        telea_weight = min(0.95, telea_weight + 0.05)
+
+    repair = lama * (1.0 - telea_weight) + telea * telea_weight
+    composed = original * (1.0 - mask_alpha) + repair * mask_alpha
+    return np.clip(composed, 0, 255).astype(np.uint8)
+
+
 def soft_compose_with_mask(
     base_rgb: np.ndarray,
     overlay_rgb: np.ndarray,
@@ -156,6 +219,161 @@ def soft_compose_with_mask(
     overlay_np = overlay_rgb.astype(np.float32)
     composed = base_np * (1.0 - alpha_np) + overlay_np * alpha_np
     return np.clip(composed, 0, 255).astype(np.uint8)
+
+
+def _ensure_binary_mask(mask: np.ndarray, name: str) -> np.ndarray:
+    if mask.ndim != 2:
+        raise ValueError(f"{name} debe tener 2 dimensiones")
+    return np.where(mask > 0, 255, 0).astype(np.uint8)
+
+
+def _ensure_rgb_image(image: np.ndarray, name: str) -> np.ndarray:
+    if image.ndim != 3 or image.shape[2] != 3:
+        raise ValueError(f"{name} debe tener forma (H, W, 3)")
+    return np.clip(image, 0, 255).astype(np.uint8)
+
+
+def clean_damage_mask(
+    mask_bin: np.ndarray,
+    min_area: int = DEFAULT_MIN_AREA,
+    close_kernel_size: int = 7,
+    dilate_kernel_size: int = 3,
+    dilate_iterations: int = 2,
+) -> np.ndarray:
+    """
+    Limpia una mascara binaria de dano eliminando componentes pequenas,
+    cerrando cortes y expandiendo levemente los bordes.
+    """
+    mask = _ensure_binary_mask(mask_bin, "mask_bin")
+    if not np.any(mask):
+        return mask
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8))
+    clean = np.zeros_like(mask)
+    for idx in range(1, num_labels):
+        area = int(stats[idx, cv2.CC_STAT_AREA])
+        if area >= min_area:
+            clean[labels == idx] = 255
+
+    if not np.any(clean):
+        return clean
+
+    close_size = max(3, int(close_kernel_size) | 1)
+    dilate_size = max(3, int(dilate_kernel_size) | 1)
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_size, close_size))
+    dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_size, dilate_size))
+
+    clean = cv2.morphologyEx(clean, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+    clean = cv2.dilate(clean, dilate_kernel, iterations=max(0, int(dilate_iterations)))
+    return clean
+
+
+def fuse_lama_and_guide(
+    lama_rgb: np.ndarray,
+    damage_mask: np.ndarray,
+    guide_mask: np.ndarray,
+    stroke_dilation_px: int = DEFAULT_VISUAL_ASSISTED_STROKE_DILATION_PX,
+    stroke_blur_sigma: float = DEFAULT_VISUAL_ASSISTED_STROKE_BLUR_SIGMA,
+    stroke_darkening: float = DEFAULT_VISUAL_ASSISTED_STROKE_DARKENING,
+    halo_strength: float = DEFAULT_VISUAL_ASSISTED_HALO_STRENGTH,
+    halo_offset: tuple[int, int] = DEFAULT_VISUAL_ASSISTED_HALO_OFFSET,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Fusiona la textura reconstruida por LaMa con la guia del trazo de Keras.
+
+    El trazo faltante se limita a la zona dañada con `AND`, luego se dilata
+    levemente, se suaviza con GaussianBlur y se oscurece para simular un surco
+    tallado sobre la roca restaurada.
+    """
+    lama_rgb = _ensure_rgb_image(lama_rgb, "lama_rgb")
+    damage_mask = _ensure_binary_mask(damage_mask, "damage_mask")
+    guide_mask = _ensure_binary_mask(guide_mask, "guide_mask")
+
+    missing_stroke = cv2.bitwise_and(guide_mask, damage_mask)
+    if stroke_dilation_px > 0 and np.any(missing_stroke):
+        stroke_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (2 * int(stroke_dilation_px) + 1, 2 * int(stroke_dilation_px) + 1),
+        )
+        missing_stroke = cv2.dilate(missing_stroke, stroke_kernel, iterations=1)
+
+    if not np.any(missing_stroke):
+        return lama_rgb.copy(), missing_stroke
+
+    alpha = cv2.GaussianBlur(
+        (missing_stroke > 0).astype(np.float32),
+        (0, 0),
+        sigmaX=max(0.1, float(stroke_blur_sigma)),
+        sigmaY=max(0.1, float(stroke_blur_sigma)),
+    )
+    alpha = np.clip(alpha, 0.0, 1.0)[..., None]
+
+    fused = lama_rgb.astype(np.float32) * (1.0 - alpha * float(stroke_darkening))
+
+    if halo_strength > 0.0:
+        dx, dy = halo_offset
+        shift_matrix = np.float32([[1.0, 0.0, float(dx)], [0.0, 1.0, float(dy)]])
+        halo_source = cv2.warpAffine(
+            missing_stroke,
+            shift_matrix,
+            (missing_stroke.shape[1], missing_stroke.shape[0]),
+            flags=cv2.INTER_NEAREST,
+            borderValue=0,
+        )
+        halo = cv2.GaussianBlur(
+            (halo_source > 0).astype(np.float32),
+            (0, 0),
+            sigmaX=max(1.0, float(stroke_blur_sigma) * 1.35),
+            sigmaY=max(1.0, float(stroke_blur_sigma) * 1.35),
+        )
+        halo = np.clip(halo, 0.0, 1.0)[..., None]
+        highlight = np.array([12.0, 10.0, 8.0], dtype=np.float32)
+        fused += halo * float(halo_strength) * highlight
+
+    return np.clip(fused, 0, 255).astype(np.uint8), missing_stroke
+
+
+def save_rgb_png(image_rgb: np.ndarray, output_path: str | Path) -> Path:
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    ok = cv2.imwrite(str(output_path), cv2.cvtColor(image_rgb.astype(np.uint8), cv2.COLOR_RGB2BGR))
+    if not ok:
+        raise IOError(f"No se pudo guardar la imagen en {output_path}")
+    return output_path
+
+
+def save_visual_assisted_outputs(
+    output_dir: str | Path,
+    stem: str,
+    original_rgb: np.ndarray,
+    damage_probability: np.ndarray,
+    damage_mask: np.ndarray,
+    lama_rgb: np.ndarray,
+    guide_mask: np.ndarray,
+    missing_stroke: np.ndarray,
+    fused_rgb: np.ndarray,
+) -> dict[str, Path]:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    paths = {
+        "original": output_dir / f"{stem}_original.png",
+        "damage_probability": output_dir / f"{stem}_damage_probability.png",
+        "damage_mask": output_dir / f"{stem}_damage_mask.png",
+        "lama": output_dir / f"{stem}_lama.png",
+        "guide_mask": output_dir / f"{stem}_guide_mask.png",
+        "missing_stroke": output_dir / f"{stem}_missing_stroke.png",
+        "fused": output_dir / f"{stem}_fused.png",
+    }
+
+    save_rgb_png(original_rgb, paths["original"])
+    cv2.imwrite(str(paths["damage_probability"]), np.clip(damage_probability * 255.0, 0, 255).astype(np.uint8))
+    cv2.imwrite(str(paths["damage_mask"]), damage_mask)
+    save_rgb_png(lama_rgb, paths["lama"])
+    cv2.imwrite(str(paths["guide_mask"]), guide_mask)
+    cv2.imwrite(str(paths["missing_stroke"]), missing_stroke)
+    save_rgb_png(fused_rgb, paths["fused"])
+    return paths
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +448,7 @@ def reconstruct_petroglyph(
     damage_high_thresh: float = DEFAULT_DAMAGE_HIGH_THRESH,
     damage_dilation_px: int = DEFAULT_DAMAGE_DILATION_PX,
     manual_damage_mask: np.ndarray | None = None,
+    manual_damage_expansion_px: int = DEFAULT_MANUAL_DAMAGE_EXPANSION_PX,
 ) -> dict[str, object]:
     """
     Reconstruye un petroglifo deteriorado usando Keras + LaMa GAN.
@@ -267,6 +486,8 @@ def reconstruct_petroglyph(
     manual_damage_mask : np.ndarray | None
         Máscara binaria opcional (255 = zona a reconstruir). Si se proporciona,
         se usa en lugar de la detección automática de daño.
+    manual_damage_expansion_px : int
+        Expansión morfológica opcional aplicada a la máscara manual antes de LaMa.
 
     Returns
     -------
@@ -362,4 +583,85 @@ def reconstruct_petroglyph(
         "selected_threshold": float(selected["threshold"]),  # type: ignore[arg-type]
         "selected_strategy": str(selected["strategy"]),
         "damage_pixel_count": damage_pixel_count,
+    }
+
+
+def reconstruct_visual_assisted(
+    seg_model,
+    lama_model,
+    damage_model,
+    damage_device,
+    img_bgr: np.ndarray,
+    damage_threshold: float = 0.20,
+    damage_min_area: int = 30,
+    guide_threshold: float = DEFAULT_THRESHOLD,
+    guide_min_area: int = DEFAULT_MIN_AREA,
+    guide_line_width: int = DEFAULT_VISUAL_ASSISTED_GUIDE_LINE_WIDTH,
+    damage_aggressive: bool = False,
+) -> dict[str, object]:
+    """
+    Pipeline de restauracion visual asistida.
+
+    Flujo:
+      1. U-Net PyTorch v3 estima la mascara de dano.
+      2. LaMa reconstruye la textura de roca sobre esa mascara.
+      3. El modelo Keras entrega la guia del trazo.
+      4. La guia se limita a la zona dañada y se oscurece para simular grabado.
+    """
+    if damage_segmentation is None:
+        raise RuntimeError(
+            "La segmentacion PyTorch no esta disponible porque faltan dependencias "
+            f"({DAMAGE_SEGMENTATION_IMPORT_ERROR})."
+        )
+
+    img_resized = cv2.resize(img_bgr, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
+    original_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+
+    damage_probability, raw_damage_mask = damage_segmentation.predict_mask(
+        model=damage_model,
+        img_bgr=img_resized,
+        device=damage_device,
+        threshold=damage_threshold,
+        min_area=damage_min_area,
+        aggressive=damage_aggressive,
+    )
+    damage_mask = clean_damage_mask(
+        raw_damage_mask,
+        min_area=damage_min_area,
+    )
+
+    if np.any(damage_mask):
+        inpainted_bgr = _lama_inpaint(lama_model, img_resized, damage_mask)
+    else:
+        inpainted_bgr = img_resized.copy()
+
+    lama_rgb = cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB)
+
+    img_pre = preprocess(img_bgr)
+    guide_probability = predict_tta(seg_model, img_pre)
+    selected_guide = select_best_mask(guide_probability, guide_threshold, guide_min_area)
+    guide_mask_base: np.ndarray = selected_guide["mask"]  # type: ignore[assignment]
+    guide_mask = adelgazar_mascara(guide_mask_base, grosor=max(1, int(guide_line_width)))
+
+    fused_rgb, missing_stroke = fuse_lama_and_guide(
+        lama_rgb=lama_rgb,
+        damage_mask=damage_mask,
+        guide_mask=guide_mask,
+    )
+
+    return {
+        "original_rgb": original_rgb,
+        "damage_probability": damage_probability,
+        "damage_mask": damage_mask,
+        "lama_rgb": lama_rgb,
+        "guide_probability": guide_probability,
+        "guide_mask": guide_mask,
+        "guide_mask_base": guide_mask_base,
+        "missing_stroke": missing_stroke,
+        "fused_rgb": fused_rgb,
+        "damage_pixel_count": int((damage_mask > 0).sum()),
+        "guide_pixel_count": int((guide_mask > 0).sum()),
+        "selected_guide_threshold": float(selected_guide["threshold"]),  # type: ignore[arg-type]
+        "selected_guide_strategy": str(selected_guide["strategy"]),
+        "guide_metrics": selected_guide["metrics"],
     }
