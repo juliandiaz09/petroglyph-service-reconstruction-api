@@ -55,35 +55,35 @@ docker build -t pictos-gan-api .
 
 **Con GPU (recomendado):**
 ```bash
-docker run --gpus all -p 8000:8000 pictos-gan-api
+docker run --gpus all -p 8001:8001 pictos-gan-api
 ```
 
 **Solo CPU:**
 ```bash
-docker run -p 8000:8000 pictos-gan-api
+docker run -p 8001:8001 pictos-gan-api
 ```
 
 **Montar el modelo como volumen** (si no está incluido en la imagen):
 ```bash
-docker run --gpus all -p 8000:8000 -v ./modelo:/app/modelo pictos-gan-api
+docker run --gpus all -p 8001:8001 -v ./modelo:/app/modelo pictos-gan-api
 ```
 
-El servidor quedará disponible en `http://localhost:8000`.
+El servidor quedará disponible en `http://localhost:8001`.
 
 ## Uso
 
 ### Iniciar el servidor
 
 ```bash
-uvicorn service:app --reload --host 0.0.0.0 --port 8000
+uvicorn service:app --reload --host 0.0.0.0 --port 8001
 ```
 
-El servidor estará disponible en `http://localhost:8000`.
+El servidor estará disponible en `http://localhost:8001`.
 
 ### Documentación interactiva
 
-- **Swagger UI**: http://localhost:8000/docs
-- **ReDoc**: http://localhost:8000/redoc
+- **Swagger UI**: http://localhost:8001/docs
+- **ReDoc**: http://localhost:8001/redoc
 
 ## Endpoints de la API
 
@@ -157,12 +157,12 @@ Genera varias imágenes con semillas aleatorias.
 
 ```bash
 # Generar una imagen con semilla fija
-curl -X POST "http://localhost:8000/generateSingle" \
+curl -X POST "http://localhost:8001/generateSingle" \
   -H "Content-Type: application/json" \
   -d '{"seed": 12345}'
 
 # Generar 3 imágenes
-curl -X POST "http://localhost:8000/generateSeveral" \
+curl -X POST "http://localhost:8001/generateSeveral" \
   -H "Content-Type: application/json" \
   -d '{"number": 3}'
 ```

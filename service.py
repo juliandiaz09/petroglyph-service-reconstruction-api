@@ -92,8 +92,22 @@ def array_to_png_bytes(image_array: np.ndarray) -> bytes:
     return buf.getvalue()
 
 
+def normalize_warnings(raw_warnings) -> list[str]:
+    if raw_warnings is None:
+        return []
+    if isinstance(raw_warnings, list):
+        return [str(item) for item in raw_warnings if item is not None and str(item).strip()]
+    if isinstance(raw_warnings, tuple) or isinstance(raw_warnings, set):
+        return [str(item) for item in raw_warnings if item is not None and str(item).strip()]
+    if isinstance(raw_warnings, str):
+        text = raw_warnings.strip()
+        return [text] if text else []
+    text = str(raw_warnings).strip()
+    return [text] if text else []
+
+
 def build_segmentation_status(metrics: dict, strategy: str) -> str:
-    warnings = set(metrics.get("warnings", []))
+    warnings = set(normalize_warnings(metrics.get("warnings")))
     if "mask_empty" in warnings or "mask_too_small" in warnings:
         return "weak_segmentation"
     if "mask_too_large" in warnings:
@@ -251,7 +265,7 @@ async def segment_petroglyph(
         "selected_threshold": float(selected_mask["threshold"]),
         "selected_strategy": str(selected_mask["strategy"]),
         "validation_score": round(float(metrics["score"]), 2),
-        "validation_warnings": list(metrics["warnings"]),
+        "validation_warnings": normalize_warnings(metrics.get("warnings")),
         "component_count": int(metrics["component_count"]),
         "size": {
             "width": petroglyph.IMG_SIZE,
@@ -562,7 +576,7 @@ async def reconstruct_petroglyph_full(
         "selected_threshold": result["selected_threshold"],
         "selected_strategy": result["selected_strategy"],
         "validation_score": round(float(metrics["score"]), 2),
-        "validation_warnings": list(metrics["warnings"]),
+        "validation_warnings": normalize_warnings(metrics.get("warnings")),
         "component_count": int(metrics["component_count"]),
         "size": {
             "width": petroglyph.IMG_SIZE,
