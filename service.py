@@ -458,7 +458,7 @@ async def reconstruct_petroglyph(
         manual_damage_mask=manual_damage_mask,
     )
 
-    return Response(content=array_to_png_bytes(result["composed_rgb"]), media_type="image/png")
+    return Response(content=array_to_png_bytes(result["figure_fused_rgb"]), media_type="image/png")
 
 
 @app.post(

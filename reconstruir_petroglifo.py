@@ -568,10 +568,16 @@ def reconstruct_petroglyph(
     background_rgb, background_name = choose_background(background_path)
     rendered_rgb = render_petroglyph(background_rgb, final_mask)
 
+    # 8. Fusión figura: composed_rgb (LaMa) recortado por la máscara de probabilidad
+    #    sobre el fondo pétreo. Resultado: la figura del petroglifo reconstruida
+    #    visible, con el contenido real de LaMa dentro de su silueta.
+    figure_fused_rgb = soft_compose_with_mask(background_rgb, composed_rgb, final_mask)
+
     return {
         "original_rgb": original_rgb,
         "inpainted_rgb": inpainted_rgb,
         "composed_rgb": composed_rgb,
+        "figure_fused_rgb": figure_fused_rgb,
         "probability": probability,
         "probability_merged": probability_merged,
         "filled_mask": final_mask,
