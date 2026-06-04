@@ -171,8 +171,8 @@ curl -X POST "http://localhost:8001/generateSeveral" \
 
 El modelo `modelo/unet_danos_petroglifos_v3.pth` se usa con la configuracion del notebook:
 
-- `threshold = 0.20`
-- `min_area = 30`
+- `threshold = 0.30`
+- `min_area = 50`
 - limpieza morfologica ligera con dilatacion para preparar la mascara de LaMa
 
 Se puede ejecutar de dos formas:
@@ -200,6 +200,7 @@ El pipeline nuevo combina:
 Endpoint principal:
 
 - `POST /reconstructVisualAssisted`
+- `POST /reconstructVisualAssistedPng` para obtener `fused_image` como PNG directo
 
 La respuesta incluye:
 
@@ -209,6 +210,8 @@ La respuesta incluye:
 - `missing_stroke_image`
 - `final_image`
 - `saved_paths` cuando `save_png=true`
+
+La variante `Png` devuelve directamente la imagen fusionada final como `image/png`.
 
 ## Estructura del proyecto
 

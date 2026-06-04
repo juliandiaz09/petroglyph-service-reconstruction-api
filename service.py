@@ -369,7 +369,7 @@ async def segment_damage_pytorch(
     summary="Reconstrucción de petroglifo (salida imagen PNG)",
     description=(
         "Recibe una imagen de un petroglifo deteriorado y devuelve la imagen "
-        "reconstruida como PNG binario. "
+        "reconstruida principal como PNG binario. "
         "Compatible con el agente A5 del sistema multiagente BackendPetroglifos "
         "(settings.gan_api_url)."
     ),
@@ -458,6 +458,8 @@ async def reconstruct_petroglyph(
         manual_damage_mask=manual_damage_mask,
     )
 
+    # La salida fusionada final del pipeline es `figure_fused_rgb`.
+    # Es la imagen que combina la reconstrucción con el fondo pétreo.
     return Response(content=array_to_png_bytes(result["figure_fused_rgb"]), media_type="image/png")
 
 
@@ -827,3 +829,85 @@ async def reconstruct_visual_assisted(
         response["saved_paths"] = {key: str(path) for key, path in output_paths.items()}
 
     return response
+
+
+@app.post(
+    "/reconstructVisualAssistedPng",
+    summary="Reconstruccion visual asistida (salida PNG fused)",
+    description=(
+        "Ejecuta el pipeline visual asistido y devuelve directamente la imagen "
+        "fused_image como PNG binario."
+    ),
+    response_class=Response,
+)
+async def reconstruct_visual_assisted_png(
+    file: UploadFile = File(...),
+    damage_threshold: float = Form(DEFAULT_DAMAGE_SEGMENTATION_THRESHOLD),
+    damage_min_area: int = Form(DEFAULT_DAMAGE_SEGMENTATION_MIN_AREA),
+    guide_threshold: float = Form(DEFAULT_SEGMENTATION_THRESHOLD),
+    guide_min_area: int = Form(DEFAULT_SEGMENTATION_MIN_AREA),
+    guide_line_width: int = Form(DEFAULT_SEGMENTATION_LINE_WIDTH),
+):
+    global SEGMENTATION_MODEL, LAMA_MODEL
+
+    if not (0.0 < damage_threshold < 1.0):
+        raise HTTPException(status_code=400, detail="damage_threshold debe estar en (0, 1)")
+    if not (0 < damage_min_area <= 50000):
+        raise HTTPException(status_code=400, detail="damage_min_area debe estar entre 1 y 50000")
+    if not (0.0 < guide_threshold < 1.0):
+        raise HTTPException(status_code=400, detail="guide_threshold debe estar en (0, 1)")
+    if not (0 <= guide_min_area <= 50000):
+        raise HTTPException(status_code=400, detail="guide_min_area debe estar entre 0 y 50000")
+    if not (1 <= guide_line_width <= 25):
+        raise HTTPException(status_code=400, detail="guide_line_width debe estar entre 1 y 25")
+
+    if petroglyph is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "La segmentacion no esta disponible porque faltan dependencias del modelo "
+                f"({PETROGLYPH_IMPORT_ERROR})."
+            ),
+        )
+    if reconstruir is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Reconstruccion no disponible: {RECONSTRUCTION_IMPORT_ERROR}",
+        )
+    if SEGMENTATION_MODEL is None:
+        raise HTTPException(status_code=500, detail="Modelo Keras no cargado")
+    if LAMA_MODEL is None:
+        raise HTTPException(status_code=500, detail="Modelo LaMa no cargado")
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Debes enviar un archivo de imagen valido")
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="La imagen enviada esta vacia")
+
+    np_buffer = np.frombuffer(content, np.uint8)
+    img_bgr = petroglyph.cv2.imdecode(np_buffer, petroglyph.cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        raise HTTPException(status_code=400, detail="No se pudo leer la imagen enviada")
+
+    damage_model, damage_device = ensure_pytorch_damage_model()
+    try:
+        result = reconstruir.reconstruct_visual_assisted(
+            SEGMENTATION_MODEL,
+            LAMA_MODEL,
+            damage_model,
+            damage_device,
+            img_bgr,
+            damage_threshold=damage_threshold,
+            damage_min_area=damage_min_area,
+            guide_threshold=guide_threshold,
+            guide_min_area=guide_min_area,
+            guide_line_width=guide_line_width,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"No se pudo ejecutar el pipeline asistido: {exc}") from exc
+
+    return Response(
+        content=array_to_png_bytes(result["fused_rgb"]),
+        media_type="image/png",
+    )

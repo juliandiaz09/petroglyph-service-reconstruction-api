@@ -43,8 +43,8 @@ from segmentar_petroglifo import (
 # ---------------------------------------------------------------------------
 # Parámetros públicos del módulo
 # ---------------------------------------------------------------------------
-DEFAULT_DAMAGE_LOW_THRESH: float = 0.10
-DEFAULT_DAMAGE_HIGH_THRESH: float = 0.45
+DEFAULT_DAMAGE_LOW_THRESH: float = 0.15
+DEFAULT_DAMAGE_HIGH_THRESH: float = 0.55
 DEFAULT_DAMAGE_DILATION_PX: int = 30
 DEFAULT_COMPOSE_BLUR_RADIUS: float = 3.0
 DEFAULT_MANUAL_DAMAGE_EXPANSION_PX: int = 0
@@ -101,10 +101,10 @@ def load_lama_model(model_path: str | None = DEFAULT_LAMA_MODEL_PATH) -> object:
     fine_tuned_path = Path(model_path) if model_path else None
 
     if fine_tuned_path is not None and fine_tuned_path.is_file():
-        print(f"  → Usando pesos fine-tuneados: {fine_tuned_path}")
+        print(f"  -> Usando pesos fine-tuneados: {fine_tuned_path}")
         os.environ["LAMA_MODEL"] = str(fine_tuned_path)
     else:
-        print("  → Pesos fine-tuneados no encontrados, usando pesos genéricos preentrenados.")
+        print("  -> Pesos fine-tuneados no encontrados, usando pesos genericos preentrenados.")
         os.environ.pop("LAMA_MODEL", None)
 
     return SimpleLama()
